@@ -983,6 +983,217 @@ Click Send.
 You should get a 200 OK and the "Welcome, Admin!" message if the role is correctly configured.
 ----------------------------------------------------------------------------------------------------------------------
 
+####################################################
+Implementing JWT Token
+####################################################
+
+Download the dependency
+------------------------
+<dependency>
+    <groupId>com.auth0</groupId>
+    <artifactId>java-jwt</artifactId>
+    <version>4.4.0</version>
+</dependency>
+
+
+Create JWTService class
+---------------------------
+package com.authservice.jwt;
+
+import java.util.Date;
+import org.springframework.stereotype.Service;
+import com.auth0.jwt.JWT;
+import com.auth0.jwt.algorithms.Algorithm;
+
+@Service
+public class JwtService {
+
+    private static final String SECRET_KEY = "my-super-secret-key";
+    private static final long EXPIRATION_TIME = 86400000; // 1 day
+
+    public String generateToken(String username, String role) {
+        return JWT.create()
+            .withSubject(username)
+            .withClaim("role", role)
+            .withIssuedAt(new Date())
+            .withExpiresAt(new Date(System.currentTimeMillis() + EXPIRATION_TIME))
+            .sign(Algorithm.HMAC256(SECRET_KEY));
+    }
+
+    public String validateTokenAndRetrieveSubject(String token) {
+        return JWT.require(Algorithm.HMAC256(SECRET_KEY))
+            .build()
+            .verify(token)
+            .getSubject();
+    }
+}
+
+Modify AuthController  Class
+--------------------------------
+
+@Autowired
+private JwtService jwtService;
+
+@PostMapping("/login")
+public ResponseEntity<APIResponse<String>> loginCheck(@RequestBody LoginDto loginDto) {
+    APIResponse<String> response = new APIResponse<>();
+
+    UsernamePasswordAuthenticationToken token = 
+        new UsernamePasswordAuthenticationToken(loginDto.getUsername(), loginDto.getPassword());
+
+    try {
+        Authentication authenticate = authManager.authenticate(token);
+        if (authenticate.isAuthenticated()) {
+            String jwtToken = jwtService.generateToken(loginDto.getUsername(),
+                authenticate.getAuthorities().iterator().next().getAuthority());
+
+            response.setMessage("Login Successful");
+            response.setStatus(200);
+            response.setData(jwtToken);  // return JWT
+            return new ResponseEntity<>(response, HttpStatusCode.valueOf(response.getStatus()));
+        }
+    } catch (Exception e) {
+        e.printStackTrace();
+    }
+
+    response.setMessage("Failed");
+    response.setStatus(401);
+    response.setData("Unauthorized");
+    return new ResponseEntity<>(response, HttpStatusCode.valueOf(response.getStatus()));
+}
+
+Develop JWTFilter Class
+-----------------------------
+
+package com.authservice.jwt;
+
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.security.web.authentication.WebAuthenticationDetailsSource;
+import org.springframework.stereotype.Component;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+import com.authservice.service.CustomerUserDetailsService;
+
+import java.io.IOException;
+
+@Component
+public class JwtFilter extends OncePerRequestFilter {
+
+    @Autowired
+    private JwtService jwtService;
+
+    @Autowired
+    private CustomerUserDetailsService userDetailsService;
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request,
+                                    HttpServletResponse response,
+                                    FilterChain filterChain) throws ServletException, IOException {
+
+        String authHeader = request.getHeader("Authorization");
+        if (authHeader != null && authHeader.startsWith("Bearer ")) {
+            String jwt = authHeader.substring(7);
+            String username = jwtService.validateTokenAndRetrieveSubject(jwt);
+
+            if (username != null && SecurityContextHolder.getContext().getAuthentication() == null) {
+                var userDetails = userDetailsService.loadUserByUsername(username);
+                var authToken = new UsernamePasswordAuthenticationToken(
+                        userDetails, null, userDetails.getAuthorities());
+
+                authToken.setDetails(new WebAuthenticationDetailsSource().buildDetails(request));
+                SecurityContextHolder.getContext().setAuthentication(authToken);
+            }
+        }
+
+        filterChain.doFilter(request, response);
+    }
+}
+
+Modify Secuirty Config
+---------------------------
+
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.authentication.AuthenticationManager;
+import org.springframework.security.authentication.AuthenticationProvider;
+import org.springframework.security.authentication.dao.DaoAuthenticationProvider;
+import org.springframework.security.config.annotation.authentication.configuration.AuthenticationConfiguration;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+
+import com.authservice.service.CustomerUserDetailsService;
+import com.authservice.service.JwtFilter;
+
+@Configuration
+@EnableWebSecurity
+public class AppSecurityConfig {
+	
+	@Autowired
+	private CustomerUserDetailsService customerUserDetailsService;
+	
+	@Autowired
+	private JwtFilter filter;
+
+    String[] publicEndpoints = {
+        "/api/v1/auth/register",
+        "/api/v1/auth/login",
+        "/api/v1/auth/update-password",
+        "/v3/api-docs/**",
+        "/swagger-ui/**",
+        "/swagger-ui.html",
+        "/swagger-resources/**",
+        "/webjars/**"
+    };
+
+    @Bean
+    public PasswordEncoder getEncoder() {
+        return new BCryptPasswordEncoder();
+    }
+    
+    @Bean
+	public AuthenticationManager authManager(AuthenticationConfiguration config) throws Exception {
+		return config.getAuthenticationManager();
+	}
+    
+    @Bean
+	public AuthenticationProvider authProvider() {
+
+		DaoAuthenticationProvider authProvider = new DaoAuthenticationProvider();
+
+		authProvider.setUserDetailsService(customerUserDetailsService);
+		authProvider.setPasswordEncoder(getEncoder());
+
+		return authProvider;
+	}
+
+    @Bean
+	public SecurityFilterChain securityConfig(HttpSecurity http) throws Exception{
+		
+		http.authorizeHttpRequests( req -> {
+			req.requestMatchers(publicEndpoints)
+			   .permitAll()
+			   .requestMatchers("/api/v1/admin/welcome").hasRole("ADMIN")
+			   .anyRequest()
+			   .authenticated();			
+		}) .authenticationProvider(authProvider())
+        .addFilterBefore(filter, UsernamePasswordAuthenticationFilter.class);
+		
+		return http.csrf().disable().build();
+	}
+
+
+}
 
 
 
